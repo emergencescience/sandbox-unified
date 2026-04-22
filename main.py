@@ -307,6 +307,8 @@ async def verify_llm(req: VerifyRequest):
         else:
             raise HTTPException(status_code=400, detail=f"Provider {provider} not supported.")
             
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
