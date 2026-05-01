@@ -20,7 +20,11 @@ app = FastAPI(title="Unified Sandbox Adapter")
 # Configuration for LLM Sandbox
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DEFAULT_PROVIDER = os.getenv("DEFAULT_VLM_PROVIDER", "deepseek/deepseek-chat")
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+DEFAULT_PROVIDER = os.getenv("DEFAULT_VLM_PROVIDER", "deepseek-v4-pro")
+DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -210,6 +214,58 @@ def call_openai(prompt: str, image_base64: str, submission_id: Optional[str] = N
         raw_output=response.choices[0].message.content
     )
 
+def call_dashscope(prompt: str, solution_data: str, model_name: str = "deepseek-v4-pro") -> VerifyResponse:
+    # Determine if solution_data is base64 image or text
+    is_base64_image = False
+    if len(solution_data) > 100 and " " not in solution_data and (solution_data.startswith("iV") or solution_data.startswith("/9j/")):
+        is_base64_image = True
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    if is_base64_image:
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{solution_data}"}},
+            ]
+        })
+    else:
+        messages.append({
+            "role": "user",
+            "content": f"Evaluation Prompt:\n{prompt}\n\nSubmission Data:\n{solution_data}"
+        })
+
+    client = OpenAI(
+        base_url=DASHSCOPE_BASE_URL,
+        api_key=DASHSCOPE_API_KEY
+    )
+    
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        response_format={"type": "json_object"},
+        max_tokens=300,
+    )
+    
+    try:
+        res = json.loads(response.choices[0].message.content)
+        pass_status = res.get("pass", False)
+        reason = res.get("reason", "No reason provided")
+        confidence = res.get("confidence")
+    except Exception as e:
+        print(f"[ERROR] Failed to parse DashScope JSON: {str(e)}")
+        pass_status = False
+        reason = f"Error parsing LLM output: {str(e)}"
+        confidence = 0.0
+
+    return VerifyResponse(
+        pass_status=pass_status,
+        reason=reason,
+        confidence=confidence,
+        raw_output=response.choices[0].message.content
+    )
+
 def call_openrouter(prompt: str, solution_data: str, provider: str) -> VerifyResponse:
     # MVP Length proxy limit to control costs (5000 chars ~ 1250 tokens)
     if len(solution_data) > 5000 and not solution_data.startswith("iVBORw0K"):
@@ -242,7 +298,7 @@ def call_openrouter(prompt: str, solution_data: str, provider: str) -> VerifyRes
 
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
-        api_key=os.getenv("OPENROUTER_API_KEY", "")
+        api_key=OPENROUTER_API_KEY or ""
     )
     
     # provider format from frontend: "deepseek/deepseek-chat", fallback to deepseek
@@ -273,6 +329,7 @@ def call_openrouter(prompt: str, solution_data: str, provider: str) -> VerifyRes
         raw_output=response.choices[0].message.content
     )
 
+
 @app.post("/verify/llm", response_model=VerifyResponse)
 async def verify_llm(req: VerifyRequest):
     provider = req.provider or DEFAULT_PROVIDER
@@ -286,9 +343,24 @@ async def verify_llm(req: VerifyRequest):
         raise HTTPException(status_code=400, detail="Only candidate_solution / image_base64 is supported in MVP.")
 
     try:
-        # Route logic using new OpenRouter functionality for slash models
+        # Route logic
+        if provider == "deepseek-v4-pro" or provider.startswith("dashscope/"):
+            if not DASHSCOPE_API_KEY:
+                # If DashScope is not configured, we might want to fallback to OpenRouter immediately
+                # or raise error if it was explicitly requested.
+                if req.provider:
+                    raise HTTPException(status_code=500, detail="DashScope API key not configured.")
+                provider = "deepseek/deepseek-chat" # Fallback for default
+            else:
+                model_name = provider.split("/")[-1] if "/" in provider else "deepseek-v4-pro"
+                try:
+                    return call_dashscope(req.prompt, solution_data, model_name)
+                except Exception as e:
+                    print(f"[WARNING] DashScope failed: {str(e)}. Falling back to OpenRouter.")
+                    provider = "deepseek/deepseek-chat"
+
         if "/" in provider:
-            if not os.getenv("OPENROUTER_API_KEY"):
+            if not OPENROUTER_API_KEY:
                 raise HTTPException(status_code=500, detail="OpenRouter API key not configured.")
             return call_openrouter(req.prompt, solution_data, provider)
             
